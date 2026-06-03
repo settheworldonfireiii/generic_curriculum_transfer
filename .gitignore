@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.DS_Store
+logs/
+runs/
+*.log
+*.tar.gz
+*.zip
+wandb/
+

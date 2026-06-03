@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "generic-curriculum-transfer"
+version = "0.1.0"
+description = "Dataset-agnostic curriculum transfer scaffold with HF datasets, PyTorch DataLoader, SLURM/cloud orchestration, W&B, and optional Spark/Airflow."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "accelerate>=0.30",
+  "datasets>=2.19",
+  "numpy>=1.24",
+  "pandas>=2.0",
+  "pyyaml>=6.0",
+  "torch>=2.2",
+  "tqdm>=4.66",
+  "transformers>=4.41",
+]
+
+[project.optional-dependencies]
+airflow = ["apache-airflow>=2.8"]
+sae = ["eai-sparsify>=1.0"]
+spark = ["pyspark>=3.5", "pyarrow>=15"]
+wandb = ["wandb>=0.16"]
+dev = ["pytest>=8.0", "ruff>=0.5"]
+
+[project.scripts]
+gct = "gct.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["gct*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
