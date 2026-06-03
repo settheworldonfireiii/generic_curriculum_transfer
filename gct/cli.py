@@ -25,6 +25,11 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--generation-batch-size", type=int, default=None)
     parser.add_argument("--backend", choices=["local", "slurm", "ibm"], default=None)
+    parser.add_argument("--wandb-api-key", default=None, help="W&B API key for online/offline synced runs.")
+    parser.add_argument("--wandb-mode", choices=["online", "offline", "disabled"], default=None)
+    parser.add_argument("--wandb-project", default=None)
+    parser.add_argument("--wandb-entity", default=None)
+    parser.add_argument("--wandb-log-interval", type=int, default=None)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     prepare = subparsers.add_parser("prepare-data", help="Load HF data and save normalized tasks.")
@@ -264,6 +269,19 @@ def config_from_args(args: argparse.Namespace) -> ExperimentConfig:
         overrides["runtime"] = runtime_overrides
     if args.backend is not None:
         overrides["backend"] = {"kind": args.backend}
+    telemetry_overrides: dict[str, Any] = {}
+    if args.wandb_api_key is not None:
+        telemetry_overrides["wandb_api_key"] = args.wandb_api_key
+    if args.wandb_mode is not None:
+        telemetry_overrides["wandb_mode"] = args.wandb_mode
+    if args.wandb_project is not None:
+        telemetry_overrides["wandb_project"] = args.wandb_project
+    if args.wandb_entity is not None:
+        telemetry_overrides["wandb_entity"] = args.wandb_entity
+    if args.wandb_log_interval is not None:
+        telemetry_overrides["wandb_log_interval"] = args.wandb_log_interval
+    if telemetry_overrides:
+        overrides["telemetry"] = telemetry_overrides
     return load_config(args.config, overrides)
 
 

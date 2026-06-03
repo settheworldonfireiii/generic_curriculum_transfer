@@ -47,6 +47,8 @@ telemetry:
   wandb_project: generic-curriculum-transfer
   wandb_entity: null
   wandb_mode: offline
+  wandb_api_key: null
+  wandb_log_interval: 20
 
 sae:
   enabled: true

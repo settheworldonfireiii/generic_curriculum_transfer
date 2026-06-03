@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from gct.config.schema import ExperimentConfig
@@ -12,12 +13,15 @@ class WandbRun:
         self.run: Any | None = None
 
     def __enter__(self) -> "WandbRun":
-        if not self.config.telemetry.wandb_project:
+        if not self.config.telemetry.wandb_project or self.config.telemetry.wandb_mode == "disabled":
             return self
         try:
             import wandb
         except ImportError:
             return self
+        if self.config.telemetry.wandb_api_key:
+            os.environ["WANDB_API_KEY"] = self.config.telemetry.wandb_api_key
+            wandb.login(key=self.config.telemetry.wandb_api_key, relogin=True)
         self.run = wandb.init(
             project=self.config.telemetry.wandb_project,
             entity=self.config.telemetry.wandb_entity,
@@ -38,4 +42,3 @@ class WandbRun:
     def __exit__(self, *args: object) -> None:
         if self.run is not None:
             self.run.finish()
-

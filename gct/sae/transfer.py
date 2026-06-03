@@ -9,6 +9,7 @@ from tqdm import tqdm
 
 from gct.config.schema import ExperimentConfig
 from gct.telemetry.metrics import AsyncMetrics, NullMetrics
+from gct.telemetry.wandb import WandbRun
 from gct.utils.hashing import stable_seed
 from gct.utils.jsonl import append_jsonl, read_jsonl
 
@@ -60,39 +61,56 @@ def run_sae_transfer(
     )
     model.eval()
 
-    try:
-        for row in tqdm(neighbors, desc="SAE transfer"):
-            target_id = row["target_task_id"]
-            anchor_id = row["anchor_task_id"]
-            if target_id not in tasks or anchor_id not in tasks or anchor_id not in anchor_solutions:
-                continue
-            prompt = build_transfer_prompt(tasks[anchor_id]["prompt"], anchor_solutions[anchor_id], tasks[target_id]["prompt"])
-            for sample_index in range(samples_per_target):
-                if (target_id, sample_index) in done:
+    step = 0
+    with WandbRun(config, "sae-transfer") as wandb_run:
+        try:
+            for row in tqdm(neighbors, desc="SAE transfer"):
+                target_id = row["target_task_id"]
+                anchor_id = row["anchor_task_id"]
+                if target_id not in tasks or anchor_id not in tasks or anchor_id not in anchor_solutions:
                     continue
-                seed = stable_seed(config.runtime.seed, target_id, anchor_id, sample_index)
-                started = time.perf_counter()
-                output = _generate_once(model, tokenizer, prompt, config, seed, torch)
-                elapsed = time.perf_counter() - started
-                append_jsonl(
-                    raw_out,
-                    [
-                        {
-                            "target_task_id": target_id,
-                            "anchor_task_id": anchor_id,
-                            "sample_index": sample_index,
-                            "raw_output": output,
-                            "latency_s": elapsed,
-                            "score_variant": row.get("score_variant", ""),
-                            "layer_regime": row.get("layer_regime", ""),
-                            "combined_similarity": row.get("combined_similarity", ""),
-                        }
-                    ],
+                prompt = build_transfer_prompt(
+                    tasks[anchor_id]["prompt"],
+                    anchor_solutions[anchor_id],
+                    tasks[target_id]["prompt"],
                 )
-                metrics.observe("sae_transfer.latency_s", elapsed, {"score_variant": row.get("score_variant", "")})
-                metrics.incr("sae_transfer.generations")
-    finally:
-        metrics.close()
+                for sample_index in range(samples_per_target):
+                    if (target_id, sample_index) in done:
+                        continue
+                    seed = stable_seed(config.runtime.seed, target_id, anchor_id, sample_index)
+                    started = time.perf_counter()
+                    output = _generate_once(model, tokenizer, prompt, config, seed, torch)
+                    elapsed = time.perf_counter() - started
+                    append_jsonl(
+                        raw_out,
+                        [
+                            {
+                                "target_task_id": target_id,
+                                "anchor_task_id": anchor_id,
+                                "sample_index": sample_index,
+                                "raw_output": output,
+                                "latency_s": elapsed,
+                                "score_variant": row.get("score_variant", ""),
+                                "layer_regime": row.get("layer_regime", ""),
+                                "combined_similarity": row.get("combined_similarity", ""),
+                            }
+                        ],
+                    )
+                    metrics.observe("sae_transfer.latency_s", elapsed, {"score_variant": row.get("score_variant", "")})
+                    metrics.incr("sae_transfer.generations")
+                    if _should_log_wandb(config.telemetry.wandb_log_interval, step):
+                        wandb_run.log(
+                            {
+                                "sae_transfer/latency_s": elapsed,
+                                "sae_transfer/generations": step + 1,
+                                "sae_transfer/combined_similarity": _float_or_zero(row.get("combined_similarity")),
+                            },
+                            step=step,
+                        )
+                    step += 1
+        finally:
+            metrics.close()
+        wandb_run.log({"sae_transfer/total_generations": step}, step=step)
     return raw_out
 
 
@@ -164,3 +182,13 @@ def _model_device(model: Any) -> Any:
     except AttributeError:
         return next(model.parameters()).device
 
+
+def _should_log_wandb(interval: int, step: int) -> bool:
+    return interval > 0 and step % interval == 0
+
+
+def _float_or_zero(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0

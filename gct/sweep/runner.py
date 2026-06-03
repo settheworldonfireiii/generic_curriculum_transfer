@@ -10,6 +10,7 @@ from gct.config.schema import ExperimentConfig
 from gct.sweep.grading import answers_match, extract_final_answer
 from gct.sweep.summary import summarize_sweep
 from gct.telemetry.metrics import AsyncMetrics, NullMetrics
+from gct.telemetry.wandb import WandbRun
 from gct.utils.hashing import stable_seed
 from gct.utils.jsonl import append_jsonl, read_jsonl
 
@@ -52,41 +53,63 @@ def run_sweep(
     )
     model.eval()
 
-    try:
-        for row in tqdm(tasks, desc="sweep"):
-            expected = extract_final_answer(row.get("answer")) or row.get("answer")
-            prompt = build_problem_prompt(row["prompt"])
-            for sample_index in range(samples_per_task):
-                if (row["task_id"], sample_index) in done:
-                    continue
-                seed = stable_seed(config.runtime.seed, row["task_id"], sample_index)
-                started = time.perf_counter()
-                output = _generate_once(model, tokenizer, prompt, config, seed, torch)
-                elapsed = time.perf_counter() - started
-                predicted = extract_final_answer(output)
-                exact = answers_match(predicted, expected)
-                append_jsonl(
-                    raw_out,
-                    [
-                        {
-                            "task_id": row["task_id"],
-                            "sample_index": sample_index,
-                            "raw_output": output,
-                            "predicted": predicted,
-                            "expected": expected,
-                            "exact": exact,
-                            "latency_s": elapsed,
-                            "metadata": row.get("metadata", {}),
-                        }
-                    ],
-                )
-                metrics.observe("sweep.latency_s", elapsed)
-                metrics.incr("sweep.generations")
-                metrics.incr("sweep.successes", 1.0 if exact else 0.0)
-    finally:
-        metrics.close()
+    step = 0
+    with WandbRun(config, "sweep") as wandb_run:
+        try:
+            for row in tqdm(tasks, desc="sweep"):
+                expected = extract_final_answer(row.get("answer")) or row.get("answer")
+                prompt = build_problem_prompt(row["prompt"])
+                for sample_index in range(samples_per_task):
+                    if (row["task_id"], sample_index) in done:
+                        continue
+                    seed = stable_seed(config.runtime.seed, row["task_id"], sample_index)
+                    started = time.perf_counter()
+                    output = _generate_once(model, tokenizer, prompt, config, seed, torch)
+                    elapsed = time.perf_counter() - started
+                    predicted = extract_final_answer(output)
+                    exact = answers_match(predicted, expected)
+                    append_jsonl(
+                        raw_out,
+                        [
+                            {
+                                "task_id": row["task_id"],
+                                "sample_index": sample_index,
+                                "raw_output": output,
+                                "predicted": predicted,
+                                "expected": expected,
+                                "exact": exact,
+                                "latency_s": elapsed,
+                                "metadata": row.get("metadata", {}),
+                            }
+                        ],
+                    )
+                    metrics.observe("sweep.latency_s", elapsed)
+                    metrics.incr("sweep.generations")
+                    metrics.incr("sweep.successes", 1.0 if exact else 0.0)
+                    if _should_log_wandb(config.telemetry.wandb_log_interval, step):
+                        wandb_run.log(
+                            {
+                                "sweep/latency_s": elapsed,
+                                "sweep/exact": int(exact),
+                                "sweep/generations": step + 1,
+                            },
+                            step=step,
+                        )
+                    step += 1
+        finally:
+            metrics.close()
 
-    summarize_sweep(raw_out, summary_out, solved_ids_out)
+        summary = summarize_sweep(raw_out, summary_out, solved_ids_out)
+        total = len(summary)
+        solved = sum(1 for row in summary.values() if row["solved"])
+        wandb_run.log(
+            {
+                "sweep/solved_tasks": solved,
+                "sweep/total_tasks": total,
+                "sweep/solved_rate": solved / total if total else 0.0,
+            },
+            step=step,
+        )
     return summary_out
 
 
@@ -136,3 +159,6 @@ def _model_device(model: Any) -> Any:
     except AttributeError:
         return next(model.parameters()).device
 
+
+def _should_log_wandb(interval: int, step: int) -> bool:
+    return interval > 0 and step % interval == 0

@@ -63,6 +63,8 @@ class TelemetryConfig:
     wandb_project: str | None = "generic-curriculum-transfer"
     wandb_entity: str | None = None
     wandb_mode: str = "offline"
+    wandb_api_key: str | None = None
+    wandb_log_interval: int = 20
 
 
 @dataclass(frozen=True)
