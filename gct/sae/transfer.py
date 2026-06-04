@@ -8,6 +8,7 @@ from typing import Any
 from tqdm import tqdm
 
 from gct.config.schema import ExperimentConfig
+from gct.runtime.inference import SglangClient, use_sglang
 from gct.telemetry.metrics import AsyncMetrics, NullMetrics
 from gct.telemetry.wandb import WandbRun
 from gct.utils.hashing import stable_seed
@@ -33,11 +34,15 @@ def run_sae_transfer(
     raw_out: Path,
     samples_per_target: int = 3,
 ) -> Path:
-    try:
-        import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-    except ImportError as exc:
-        raise RuntimeError("SAE transfer requires torch and transformers.") from exc
+    torch = None
+    AutoModelForCausalLM = None
+    AutoTokenizer = None
+    if not use_sglang(config):
+        try:
+            import torch
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+        except ImportError as exc:
+            raise RuntimeError("SAE transfer requires torch and transformers for the hf inference backend.") from exc
 
     tasks = {row["task_id"]: row for row in read_jsonl(tasks_path)}
     anchor_solutions = _load_anchor_solutions(anchor_solutions_path)
@@ -49,17 +54,21 @@ def run_sae_transfer(
         else NullMetrics()
     )
 
-    tokenizer = AutoTokenizer.from_pretrained(config.model.name, trust_remote_code=config.model.trust_remote_code)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.truncation_side = "left"
-    model = AutoModelForCausalLM.from_pretrained(
-        config.model.name,
-        torch_dtype=_torch_dtype(config.model.dtype, torch),
-        device_map="auto",
-        trust_remote_code=config.model.trust_remote_code,
-    )
-    model.eval()
+    sglang_client = SglangClient(config) if use_sglang(config) else None
+    tokenizer = None
+    model = None
+    if sglang_client is None:
+        tokenizer = AutoTokenizer.from_pretrained(config.model.name, trust_remote_code=config.model.trust_remote_code)
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.truncation_side = "left"
+        model = AutoModelForCausalLM.from_pretrained(
+            config.model.name,
+            torch_dtype=_torch_dtype(config.model.dtype, torch),
+            device_map="auto",
+            trust_remote_code=config.model.trust_remote_code,
+        )
+        model.eval()
 
     step = 0
     with WandbRun(config, "sae-transfer") as wandb_run:
@@ -79,7 +88,11 @@ def run_sae_transfer(
                         continue
                     seed = stable_seed(config.runtime.seed, target_id, anchor_id, sample_index)
                     started = time.perf_counter()
-                    output = _generate_once(model, tokenizer, prompt, config, seed, torch)
+                    output = (
+                        sglang_client.generate(prompt, seed)
+                        if sglang_client is not None
+                        else _generate_once(model, tokenizer, prompt, config, seed, torch)
+                    )
                     elapsed = time.perf_counter() - started
                     append_jsonl(
                         raw_out,

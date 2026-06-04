@@ -7,6 +7,7 @@ from typing import Any
 from tqdm import tqdm
 
 from gct.config.schema import ExperimentConfig
+from gct.runtime.inference import SglangClient, use_sglang
 from gct.sweep.grading import answers_match, extract_final_answer
 from gct.sweep.summary import summarize_sweep
 from gct.telemetry.metrics import AsyncMetrics, NullMetrics
@@ -27,11 +28,15 @@ def run_sweep(
     solved_ids_out: Path,
     samples_per_task: int = 3,
 ) -> Path:
-    try:
-        import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-    except ImportError as exc:
-        raise RuntimeError("Sweep requires torch and transformers.") from exc
+    torch = None
+    AutoModelForCausalLM = None
+    AutoTokenizer = None
+    if not use_sglang(config):
+        try:
+            import torch
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+        except ImportError as exc:
+            raise RuntimeError("Sweep requires torch and transformers for the hf inference backend.") from exc
 
     tasks = list(read_jsonl(tasks_path))
     done = completed_sweep(raw_out) if config.runtime.resume else set()
@@ -41,17 +46,21 @@ def run_sweep(
         else NullMetrics()
     )
 
-    tokenizer = AutoTokenizer.from_pretrained(config.model.name, trust_remote_code=config.model.trust_remote_code)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.truncation_side = "left"
-    model = AutoModelForCausalLM.from_pretrained(
-        config.model.name,
-        torch_dtype=_torch_dtype(config.model.dtype, torch),
-        device_map="auto",
-        trust_remote_code=config.model.trust_remote_code,
-    )
-    model.eval()
+    sglang_client = SglangClient(config) if use_sglang(config) else None
+    tokenizer = None
+    model = None
+    if sglang_client is None:
+        tokenizer = AutoTokenizer.from_pretrained(config.model.name, trust_remote_code=config.model.trust_remote_code)
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.truncation_side = "left"
+        model = AutoModelForCausalLM.from_pretrained(
+            config.model.name,
+            torch_dtype=_torch_dtype(config.model.dtype, torch),
+            device_map="auto",
+            trust_remote_code=config.model.trust_remote_code,
+        )
+        model.eval()
 
     step = 0
     with WandbRun(config, "sweep") as wandb_run:
@@ -64,7 +73,11 @@ def run_sweep(
                         continue
                     seed = stable_seed(config.runtime.seed, row["task_id"], sample_index)
                     started = time.perf_counter()
-                    output = _generate_once(model, tokenizer, prompt, config, seed, torch)
+                    output = (
+                        sglang_client.generate(prompt, seed)
+                        if sglang_client is not None
+                        else _generate_once(model, tokenizer, prompt, config, seed, torch)
+                    )
                     elapsed = time.perf_counter() - started
                     predicted = extract_final_answer(output)
                     exact = answers_match(predicted, expected)

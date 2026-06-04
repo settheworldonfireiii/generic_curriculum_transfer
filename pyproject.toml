@@ -24,6 +24,7 @@ airflow = ["apache-airflow>=2.8"]
 sae = ["eai-sparsify>=1.0"]
 spark = ["pyspark>=3.5", "pyarrow>=15"]
 wandb = ["wandb>=0.16"]
+sglang = ["sglang>=0.4"]
 dev = ["pytest>=8.0", "ruff>=0.5"]
 
 [project.scripts]

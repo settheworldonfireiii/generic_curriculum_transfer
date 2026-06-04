@@ -18,7 +18,11 @@ fi
 
 conda activate "$ENV_NAME"
 python -m pip install --upgrade pip
-python -m pip install -e ".[wandb,spark,sae]"
+EXTRAS="${EXTRAS:-wandb,spark,sae}"
+if [[ "${INSTALL_SGLANG:-0}" == "1" ]] && [[ "$EXTRAS" != *sglang* ]]; then
+  EXTRAS="${EXTRAS},sglang"
+fi
+python -m pip install -e ".[${EXTRAS}]"
 
 python - <<'PY'
 import torch

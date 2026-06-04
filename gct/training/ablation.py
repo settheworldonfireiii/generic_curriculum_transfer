@@ -9,6 +9,7 @@ from tqdm import tqdm
 
 from gct.config.schema import ExperimentConfig
 from gct.data.torch_dataset import build_dataloader
+from gct.runtime.inference import SglangClient, use_sglang
 from gct.telemetry.metrics import AsyncMetrics, NullMetrics
 from gct.telemetry.wandb import WandbRun
 from gct.training.collate import build_generation_prompts
@@ -54,17 +55,21 @@ def run_ablation(config: ExperimentConfig, tasks_path: Path, raw_out: Path, samp
         prefetch_factor=config.runtime.prefetch_factor,
         shuffle=False,
     )
-    tokenizer = AutoTokenizer.from_pretrained(config.model.name, trust_remote_code=config.model.trust_remote_code)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.truncation_side = "left"
-    model = AutoModelForCausalLM.from_pretrained(
-        config.model.name,
-        torch_dtype=_torch_dtype(config.model.dtype),
-        device_map="auto",
-        trust_remote_code=config.model.trust_remote_code,
-    )
-    model.eval()
+    sglang_client = SglangClient(config) if use_sglang(config) else None
+    tokenizer = None
+    model = None
+    if sglang_client is None:
+        tokenizer = AutoTokenizer.from_pretrained(config.model.name, trust_remote_code=config.model.trust_remote_code)
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.truncation_side = "left"
+        model = AutoModelForCausalLM.from_pretrained(
+            config.model.name,
+            torch_dtype=_torch_dtype(config.model.dtype),
+            device_map="auto",
+            trust_remote_code=config.model.trust_remote_code,
+        )
+        model.eval()
 
     with WandbRun(config, "ablation") as wandb_run:
         try:
@@ -84,33 +89,45 @@ def run_ablation(config: ExperimentConfig, tasks_path: Path, raw_out: Path, samp
                     torch.manual_seed(seed)
                     if torch.cuda.is_available():
                         torch.cuda.manual_seed_all(seed)
-                    encoded = tokenizer(
-                        prompts,
-                        return_tensors="pt",
-                        padding=True,
-                        truncation=True,
-                        max_length=config.model.max_input_tokens,
-                    ).to(_model_device(model))
-                    with torch.inference_mode():
-                        output_ids = model.generate(
-                            **encoded,
-                            do_sample=config.model.temperature > 0,
-                            temperature=config.model.temperature if config.model.temperature > 0 else None,
-                            top_p=config.model.top_p if config.model.temperature > 0 else None,
-                            max_new_tokens=config.model.max_new_tokens,
-                            pad_token_id=tokenizer.pad_token_id,
-                            eos_token_id=tokenizer.eos_token_id,
+                    if sglang_client is not None:
+                        outputs = sglang_client.generate_many(
+                            prompts,
+                            [stable_seed(config.runtime.seed, sample_index, task_id) for task_id in task_ids],
                         )
+                    else:
+                        encoded = tokenizer(
+                            prompts,
+                            return_tensors="pt",
+                            padding=True,
+                            truncation=True,
+                            max_length=config.model.max_input_tokens,
+                        ).to(_model_device(model))
+                        with torch.inference_mode():
+                            output_ids = model.generate(
+                                **encoded,
+                                do_sample=config.model.temperature > 0,
+                                temperature=config.model.temperature if config.model.temperature > 0 else None,
+                                top_p=config.model.top_p if config.model.temperature > 0 else None,
+                                max_new_tokens=config.model.max_new_tokens,
+                                pad_token_id=tokenizer.pad_token_id,
+                                eos_token_id=tokenizer.eos_token_id,
+                            )
                     elapsed = time.perf_counter() - started
-                    input_width = encoded["input_ids"].shape[1]
                     rows: list[dict[str, Any]] = []
                     for offset, task_id in enumerate(task_ids):
-                        new_tokens = output_ids[offset, input_width:]
+                        output_text = (
+                            outputs[offset]
+                            if sglang_client is not None
+                            else tokenizer.decode(
+                                output_ids[offset, encoded["input_ids"].shape[1] :],
+                                skip_special_tokens=True,
+                            ).strip()
+                        )
                         rows.append(
                             {
                                 "task_id": task_id,
                                 "sample_index": sample_index,
-                                "raw_output": tokenizer.decode(new_tokens, skip_special_tokens=True).strip(),
+                                "raw_output": output_text,
                                 "latency_s": elapsed / max(1, len(task_ids)),
                                 "batch_size": len(task_ids),
                             }

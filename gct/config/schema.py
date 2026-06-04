@@ -57,6 +57,16 @@ class BackendConfig:
 
 
 @dataclass(frozen=True)
+class InferenceConfig:
+    backend: str = "hf"
+    sglang_base_url: str = "http://127.0.0.1:30000/v1"
+    sglang_api_key: str | None = None
+    sglang_model: str | None = None
+    sglang_timeout_s: float = 120.0
+    sglang_max_concurrency: int = 8
+
+
+@dataclass(frozen=True)
 class TelemetryConfig:
     enabled: bool = True
     flush_interval_s: float = 5.0
@@ -84,6 +94,7 @@ class ExperimentConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     backend: BackendConfig = field(default_factory=BackendConfig)
+    inference: InferenceConfig = field(default_factory=InferenceConfig)
     telemetry: TelemetryConfig = field(default_factory=TelemetryConfig)
     sae: SaeConfig = field(default_factory=SaeConfig)
 
@@ -96,6 +107,7 @@ class ExperimentConfig:
             runtime_raw["output_dir"] = Path(runtime_raw["output_dir"])
         runtime = RuntimeConfig(**runtime_raw)
         backend = BackendConfig(**raw.get("backend", {}))
+        inference = InferenceConfig(**raw.get("inference", {}))
         telemetry = TelemetryConfig(**raw.get("telemetry", {}))
         sae_raw = dict(raw.get("sae", {}))
         for key in ("layers", "combo_layers"):
@@ -107,6 +119,7 @@ class ExperimentConfig:
             model=model,
             runtime=runtime,
             backend=backend,
+            inference=inference,
             telemetry=telemetry,
             sae=sae,
         )

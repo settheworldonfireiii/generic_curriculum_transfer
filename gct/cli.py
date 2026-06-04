@@ -25,6 +25,12 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--generation-batch-size", type=int, default=None)
     parser.add_argument("--backend", choices=["local", "slurm", "ibm"], default=None)
+    parser.add_argument("--inference-backend", choices=["hf", "sglang"], default=None)
+    parser.add_argument("--sglang-base-url", default=None)
+    parser.add_argument("--sglang-api-key", default=None)
+    parser.add_argument("--sglang-model", default=None)
+    parser.add_argument("--sglang-timeout-s", type=float, default=None)
+    parser.add_argument("--sglang-max-concurrency", type=int, default=None)
     parser.add_argument("--wandb-api-key", default=None, help="W&B API key for online/offline synced runs.")
     parser.add_argument("--wandb-mode", choices=["online", "offline", "disabled"], default=None)
     parser.add_argument("--wandb-project", default=None)
@@ -86,6 +92,31 @@ def main(argv: list[str] | None = None) -> None:
     transfer.add_argument("--raw-out", type=Path, default=None)
     transfer.add_argument("--samples-per-target", type=int, default=3)
 
+    init_transfer_queue = subparsers.add_parser(
+        "init-transfer-work-queue",
+        help="Create a SQLite dynamic work queue from top-ranked SAE neighbor rows.",
+    )
+    init_transfer_queue.add_argument("--neighbors", type=Path, required=True)
+    init_transfer_queue.add_argument("--queue", type=Path, default=None)
+    init_transfer_queue.add_argument("--rank", type=int, default=1)
+
+    transfer_worker = subparsers.add_parser(
+        "run-dynamic-sae-transfer",
+        help="Run an SGLang-backed dynamic SAE-transfer worker from a SQLite queue.",
+    )
+    transfer_worker.add_argument("--queue", type=Path, default=None)
+    transfer_worker.add_argument("--tasks", type=Path, default=None)
+    transfer_worker.add_argument("--anchor-solutions", type=Path, required=True)
+    transfer_worker.add_argument("--raw-out", type=Path, default=None)
+    transfer_worker.add_argument("--samples-per-target", type=int, default=3)
+    transfer_worker.add_argument("--claim-size", type=int, default=1)
+    transfer_worker.add_argument("--lease-seconds", type=float, default=900.0)
+    transfer_worker.add_argument("--worker-id", default=None)
+    transfer_worker.add_argument("--max-items", type=int, default=None)
+
+    queue_status = subparsers.add_parser("work-queue-status", help="Print SQLite dynamic work queue status.")
+    queue_status.add_argument("--queue", type=Path, default=None)
+
     resource = subparsers.add_parser("resource-report", help="Detect GPU resources and estimate parallelism.")
     resource.add_argument("--out", type=Path, default=None)
 
@@ -93,7 +124,14 @@ def main(argv: list[str] | None = None) -> None:
     status.add_argument("--raw", type=Path, required=True)
     status.add_argument("--expected", type=int, default=None)
 
+    add_math_compat_subcommands(subparsers)
+
     args = parser.parse_args(argv)
+
+    if args.command.startswith("math-"):
+        run_math_compat_command(args)
+        return
+
     config = config_from_args(args)
 
     if args.command == "prepare-data":
@@ -200,6 +238,50 @@ def main(argv: list[str] | None = None) -> None:
         print(output)
         return
 
+    if args.command == "init-transfer-work-queue":
+        from gct.runtime.work_queue import SqliteWorkQueue
+        from gct.sae.transfer import load_top_neighbors
+
+        queue_path = args.queue or config.runtime.output_dir / "queues" / "sae_transfer.sqlite"
+        rows = load_top_neighbors(args.neighbors, rank=args.rank)
+        queue = SqliteWorkQueue(queue_path)
+        queue.initialize()
+        inserted = queue.enqueue_many(
+            rows,
+            id_field="target_task_id",
+            priority_field="combined_similarity",
+        )
+        print(json.dumps({"queue": str(queue_path), "inserted": inserted, "total_rows": len(rows)}, indent=2))
+        return
+
+    if args.command == "run-dynamic-sae-transfer":
+        from gct.sae.dynamic_transfer import run_dynamic_sae_transfer
+
+        queue_path = args.queue or config.runtime.output_dir / "queues" / "sae_transfer.sqlite"
+        tasks = args.tasks or config.runtime.output_dir / "datasets" / "tasks.jsonl"
+        raw_out = args.raw_out or config.runtime.output_dir / "sae_transfer" / "raw.jsonl"
+        output = run_dynamic_sae_transfer(
+            config,
+            queue_path,
+            tasks,
+            args.anchor_solutions,
+            raw_out,
+            samples_per_target=args.samples_per_target,
+            claim_size=args.claim_size,
+            lease_seconds=args.lease_seconds,
+            worker_id=args.worker_id,
+            max_items=args.max_items,
+        )
+        print(json.dumps(output, indent=2))
+        return
+
+    if args.command == "work-queue-status":
+        from gct.runtime.work_queue import SqliteWorkQueue
+
+        queue_path = args.queue or config.runtime.output_dir / "queues" / "sae_transfer.sqlite"
+        print(json.dumps(SqliteWorkQueue(queue_path).stats(), indent=2))
+        return
+
     if args.command == "resource-report":
         out = args.out or config.runtime.output_dir / "resource_report.json"
         write_resource_report(str(out), config.model.name, config.model.dtype)
@@ -223,6 +305,134 @@ def add_dataset_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-rows", type=int, default=None)
     parser.add_argument("--filter-expr", default=None)
     parser.add_argument("--streaming", action="store_true")
+
+
+def add_math_compat_subcommands(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    from gct.math_compat.utils import MATH_CONFIGS
+
+    math_sweep = subparsers.add_parser(
+        "math-sweep-sae",
+        help="Run the original Competition-MATH sweep plus SAE extraction.",
+    )
+    math_sweep.add_argument("--dataset", default="EleutherAI/hendrycks_math")
+    math_sweep.add_argument("--configs", nargs="+", default=list(MATH_CONFIGS))
+    math_sweep.add_argument("--split", default="test")
+    math_sweep.add_argument("--levels", type=int, nargs="+", default=[1, 2, 3])
+    math_sweep.add_argument("--out-dir", type=Path, default=Path("results_math"))
+    math_sweep.add_argument("--sae-repo", default="EleutherAI/sae-llama-3-8b-32x")
+    math_sweep.add_argument("--layers", type=int, nargs="+", default=[10, 16, 24, 28, 30])
+    math_sweep.add_argument("--samples-per-problem", type=int, default=3)
+    math_sweep.add_argument("--top-features-per-layer", type=int, default=256)
+    math_sweep.add_argument("--limit", type=int, default=None)
+    math_sweep.add_argument("--num-shards", type=int, default=1)
+    math_sweep.add_argument("--shard-index", type=int, default=0)
+    add_math_generation_args(math_sweep, seed=314159, max_input_tokens=4096)
+
+    merge_sweep = subparsers.add_parser(
+        "math-merge-sweep-shards",
+        help="Merge original Competition-MATH sweep shard outputs.",
+    )
+    merge_sweep.add_argument(
+        "--shard-dirs",
+        type=Path,
+        nargs="+",
+        default=[Path(f"results_math_shard{i}") for i in range(4)],
+    )
+    merge_sweep.add_argument("--out-dir", type=Path, default=Path("results_math"))
+    merge_sweep.add_argument("--top-n", type=int, default=200)
+
+    math_neighbors = subparsers.add_parser(
+        "math-build-neighbors",
+        help="Build original Competition-MATH SAE neighbor CSVs.",
+    )
+    math_neighbors.add_argument("--out-dir", type=Path, default=Path("results_math"))
+    math_neighbors.add_argument("--top-k", type=int, default=5)
+
+    math_transfer = subparsers.add_parser(
+        "math-transfer",
+        help="Run original Competition-MATH top-1 SAE-anchor transfer.",
+    )
+    math_transfer.add_argument("--out-dir", type=Path, default=Path("results_math"))
+    math_transfer.add_argument("--neighbors", type=Path, required=True)
+    math_transfer.add_argument("--raw-out", type=Path, required=True)
+    math_transfer.add_argument("--summary-out", type=Path, required=True)
+    math_transfer.add_argument("--samples-per-target", type=int, default=3)
+    math_transfer.add_argument("--target-limit", type=int, default=None)
+    math_transfer.add_argument("--num-shards", type=int, default=1)
+    math_transfer.add_argument("--shard-index", type=int, default=0)
+    add_math_generation_args(math_transfer, seed=271828, max_input_tokens=7600)
+
+    merge_transfer = subparsers.add_parser(
+        "math-merge-transfer-shards",
+        help="Merge original Competition-MATH transfer shard summaries for ablations.",
+    )
+    merge_transfer.add_argument("--out-dir", type=Path, default=Path("results_math"))
+    merge_transfer.add_argument("--regime", choices=["combo", "layer28"], default="combo")
+    merge_transfer.add_argument("--variant", choices=["cos07", "cos01"], default="cos07")
+    merge_transfer.add_argument("--summary-paths", type=Path, nargs="+", default=None)
+    merge_transfer.add_argument("--summary-out", type=Path, default=None)
+    merge_transfer.add_argument("--raw-paths", type=Path, nargs="+", default=None)
+    merge_transfer.add_argument("--raw-out", type=Path, default=None)
+
+    math_ablation = subparsers.add_parser(
+        "math-context-ablation",
+        help="Run original Competition-MATH no-context vs with-anchor ablations.",
+    )
+    math_ablation.add_argument("--out-dir", type=Path, default=Path("results_math"))
+    math_ablation.add_argument("--transfer-summary", type=Path, required=True)
+    math_ablation.add_argument("--raw-out", type=Path, required=True)
+    math_ablation.add_argument("--summary-out", type=Path, required=True)
+    math_ablation.add_argument("--run-groups", type=int, default=10)
+    math_ablation.add_argument("--samples-per-group", type=int, default=3)
+    math_ablation.add_argument("--target-limit", type=int, default=None)
+    math_ablation.add_argument("--num-shards", type=int, default=1)
+    math_ablation.add_argument("--shard-index", type=int, default=0)
+    add_math_generation_args(math_ablation, seed=161803, max_input_tokens=7600)
+
+
+def add_math_generation_args(parser: argparse.ArgumentParser, *, seed: int, max_input_tokens: int) -> None:
+    parser.add_argument("--model", default="meta-llama/Meta-Llama-3-8B-Instruct")
+    parser.add_argument("--temperature", type=float, default=0.2)
+    parser.add_argument("--top-p", type=float, default=0.9)
+    parser.add_argument("--max-new-tokens", type=int, default=512)
+    parser.add_argument("--max-input-tokens", type=int, default=max_input_tokens)
+    parser.add_argument("--seed", type=int, default=seed)
+    parser.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
+    parser.add_argument("--device-map", default="auto")
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--local-files-only", action="store_true")
+    parser.add_argument("--trust-remote-code", action="store_true")
+
+
+def run_math_compat_command(args: argparse.Namespace) -> None:
+    from gct.math_compat.commands import (
+        build_math_neighbors,
+        merge_math_sweep_shards,
+        merge_math_transfer_shards,
+        run_math_context_ablation,
+        run_math_sweep_sae,
+        run_math_transfer,
+    )
+
+    if args.command == "math-sweep-sae":
+        run_math_sweep_sae(args)
+        return
+    if args.command == "math-merge-sweep-shards":
+        merge_math_sweep_shards(args)
+        return
+    if args.command == "math-build-neighbors":
+        build_math_neighbors(args)
+        return
+    if args.command == "math-transfer":
+        run_math_transfer(args)
+        return
+    if args.command == "math-merge-transfer-shards":
+        merge_math_transfer_shards(args)
+        return
+    if args.command == "math-context-ablation":
+        run_math_context_ablation(args)
+        return
+    raise SystemExit(f"Unhandled MATH compatibility command: {args.command}")
 
 
 def config_from_args(args: argparse.Namespace) -> ExperimentConfig:
@@ -269,6 +479,21 @@ def config_from_args(args: argparse.Namespace) -> ExperimentConfig:
         overrides["runtime"] = runtime_overrides
     if args.backend is not None:
         overrides["backend"] = {"kind": args.backend}
+    inference_overrides: dict[str, Any] = {}
+    if args.inference_backend is not None:
+        inference_overrides["backend"] = args.inference_backend
+    if args.sglang_base_url is not None:
+        inference_overrides["sglang_base_url"] = args.sglang_base_url
+    if args.sglang_api_key is not None:
+        inference_overrides["sglang_api_key"] = args.sglang_api_key
+    if args.sglang_model is not None:
+        inference_overrides["sglang_model"] = args.sglang_model
+    if args.sglang_timeout_s is not None:
+        inference_overrides["sglang_timeout_s"] = args.sglang_timeout_s
+    if args.sglang_max_concurrency is not None:
+        inference_overrides["sglang_max_concurrency"] = args.sglang_max_concurrency
+    if inference_overrides:
+        overrides["inference"] = inference_overrides
     telemetry_overrides: dict[str, Any] = {}
     if args.wandb_api_key is not None:
         telemetry_overrides["wandb_api_key"] = args.wandb_api_key

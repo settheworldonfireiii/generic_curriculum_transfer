@@ -22,17 +22,31 @@ if [[ -n "${WANDB_ENTITY:-}" ]]; then
   WANDB_ARGS+=(--wandb-entity "$WANDB_ENTITY")
 fi
 
-gct --config "$CONFIG" "${WANDB_ARGS[@]}" prepare-data
-gct --config "$CONFIG" "${WANDB_ARGS[@]}" run-sweep --samples-per-task "${SWEEP_SAMPLES_PER_TASK:-3}"
-gct --config "$CONFIG" "${WANDB_ARGS[@]}" resource-report
-gct --config "$CONFIG" "${WANDB_ARGS[@]}" plan-curriculum --token-capacity "$TOKEN_CAPACITY"
-gct --config "$CONFIG" "${WANDB_ARGS[@]}" extract-sae
-gct --config "$CONFIG" "${WANDB_ARGS[@]}" build-sae-neighbors \
+INFERENCE_ARGS=()
+if [[ -n "${INFERENCE_BACKEND:-}" ]]; then
+  INFERENCE_ARGS+=(--inference-backend "$INFERENCE_BACKEND")
+fi
+if [[ -n "${SGLANG_BASE_URL:-}" ]]; then
+  INFERENCE_ARGS+=(--sglang-base-url "$SGLANG_BASE_URL")
+fi
+if [[ -n "${SGLANG_API_KEY:-}" ]]; then
+  INFERENCE_ARGS+=(--sglang-api-key "$SGLANG_API_KEY")
+fi
+if [[ -n "${SGLANG_MODEL:-}" ]]; then
+  INFERENCE_ARGS+=(--sglang-model "$SGLANG_MODEL")
+fi
+
+gct --config "$CONFIG" "${WANDB_ARGS[@]}" "${INFERENCE_ARGS[@]}" prepare-data
+gct --config "$CONFIG" "${WANDB_ARGS[@]}" "${INFERENCE_ARGS[@]}" run-sweep --samples-per-task "${SWEEP_SAMPLES_PER_TASK:-3}"
+gct --config "$CONFIG" "${WANDB_ARGS[@]}" "${INFERENCE_ARGS[@]}" resource-report
+gct --config "$CONFIG" "${WANDB_ARGS[@]}" "${INFERENCE_ARGS[@]}" plan-curriculum --token-capacity "$TOKEN_CAPACITY"
+gct --config "$CONFIG" "${WANDB_ARGS[@]}" "${INFERENCE_ARGS[@]}" extract-sae
+gct --config "$CONFIG" "${WANDB_ARGS[@]}" "${INFERENCE_ARGS[@]}" build-sae-neighbors \
   --summary "$SUMMARY" \
   --target-plan runs/competitive_math/plans/curriculum.jsonl \
   --variant "$VARIANT" \
   --layer-regime "$LAYER_REGIME"
-gct --config "$CONFIG" "${WANDB_ARGS[@]}" run-sae-transfer \
+gct --config "$CONFIG" "${WANDB_ARGS[@]}" "${INFERENCE_ARGS[@]}" run-sae-transfer \
   --neighbors "runs/competitive_math/sae/neighbors_${LAYER_REGIME}_${VARIANT}.csv" \
   --anchor-solutions "$ANCHOR_SOLUTIONS" \
   --samples-per-target "${SAMPLES_PER_TARGET:-3}"

@@ -42,12 +42,24 @@ cd generic_curriculum_transfer
 python -m pip install -e ".[wandb,sae,spark]"
 ```
 
+For SGLang serving support on a GPU host:
+
+```bash
+python -m pip install -e ".[sglang]"
+```
+
 For cloud:
 
 ```bash
 chmod +x scripts/install_cloud_env.sh
 ./scripts/install_cloud_env.sh
 conda activate arc-sae-sweep
+```
+
+To include SGLang in the cloud environment:
+
+```bash
+INSTALL_SGLANG=1 ./scripts/install_cloud_env.sh
 ```
 
 ## Default Competitive MATH Run
@@ -61,6 +73,101 @@ gct --config configs/competitive_math.yaml shard-plan --num-shards 4
 gct --config configs/competitive_math.yaml run-ablation \
   --tasks runs/competitive_math/plans/curriculum_shard0of4.jsonl \
   --raw-out runs/competitive_math/ablation/shard0of4_raw.jsonl
+```
+
+## Exact First-Project MATH Compatibility
+
+Use these commands when you want the same Competition-MATH SAE workflow as the
+original `arc_sae_transfer_experiment`: same dataset/config list, prompt
+templates, answer extraction, solved-anchor neighbor formulas, transfer prompt,
+raw/summary filenames, static sharding, and `--resume` behavior.
+
+These commands are independent of YAML config files.
+
+Sharded sweep plus SAE extraction:
+
+```bash
+for shard in 0 1 2 3; do
+  CUDA_VISIBLE_DEVICES=$shard gct math-sweep-sae \
+    --out-dir "results_math_shard${shard}" \
+    --num-shards 4 \
+    --shard-index "$shard" \
+    --resume \
+    > "sweep${shard}.log" 2>&1 &
+done
+wait
+```
+
+Merge the sweep shards and build all four neighbor files:
+
+```bash
+gct math-merge-sweep-shards \
+  --shard-dirs results_math_shard0 results_math_shard1 results_math_shard2 results_math_shard3 \
+  --out-dir results_math
+
+gct math-build-neighbors --out-dir results_math --top-k 5
+```
+
+Run transfer for one regime/variant on four GPUs:
+
+```bash
+run_math_transfer_variant () {
+  local regime="$1"
+  local variant="$2"
+  for shard in 0 1 2 3; do
+    CUDA_VISIBLE_DEVICES=$shard gct math-transfer \
+      --out-dir results_math \
+      --neighbors "results_math/neighbors_${regime}_${variant}.csv" \
+      --raw-out "results_math/transfer_${regime}_${variant}_shard${shard}of4_raw.jsonl" \
+      --summary-out "results_math/transfer_${regime}_${variant}_shard${shard}of4_summary.csv" \
+      --num-shards 4 \
+      --shard-index "$shard" \
+      --resume \
+      > "transfer_${regime}_${variant}_${shard}.log" 2>&1 &
+  done
+  wait
+  gct math-merge-transfer-shards \
+    --out-dir results_math \
+    --regime "$regime" \
+    --variant "$variant"
+}
+
+run_math_transfer_variant combo cos07
+run_math_transfer_variant combo cos01
+run_math_transfer_variant layer28 cos07
+run_math_transfer_variant layer28 cos01
+```
+
+Run context ablations for a merged transfer summary:
+
+```bash
+for shard in 0 1 2 3; do
+  CUDA_VISIBLE_DEVICES=$shard gct math-context-ablation \
+    --out-dir results_math \
+    --transfer-summary results_math/transfer_combo_cos07_summary.csv \
+    --raw-out "results_math/ablation_combo_cos07_shard${shard}of4_raw.jsonl" \
+    --summary-out "results_math/ablation_combo_cos07_shard${shard}of4_summary.csv" \
+    --run-groups 10 \
+    --samples-per-group 3 \
+    --num-shards 4 \
+    --shard-index "$shard" \
+    --resume \
+    >> "ablate_combo_cos07_${shard}.log" 2>&1 &
+done
+wait
+```
+
+The exact compatibility outputs are:
+
+```text
+results_math/math_tasks.jsonl
+results_math/math_sweep_raw.jsonl
+results_math/math_sweep_summary.csv
+results_math/math_solved_ids.txt
+results_math/math_sae_task_layer_rows.jsonl
+results_math/neighbors_{combo,layer28}_{cos07,cos01}.csv
+results_math/transfer_<regime>_<variant>_summary.csv
+results_math/ablation_<regime>_<variant>_shard<idx>of<num>_raw.jsonl
 ```
 
 ## W&B
@@ -134,6 +241,77 @@ gct --config configs/competitive_math.yaml build-sae-neighbors \
 gct --config configs/competitive_math.yaml run-sae-transfer \
   --neighbors runs/competitive_math/sae/neighbors_combo_cos07.csv \
   --anchor-solutions runs/competitive_math/sweep/raw.jsonl
+```
+
+## SGLang Inference Backend
+
+`run-sweep`, `run-ablation`, and `run-sae-transfer` can use an SGLang
+OpenAI-compatible server instead of loading a local Hugging Face model in each
+runner. SAE extraction still uses local torch/HF because it needs hidden states
+and SAE activations.
+
+Start a single-GPU SGLang server:
+
+```bash
+python -m sglang.launch_server \
+  --model-path meta-llama/Meta-Llama-3-8B-Instruct \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+Then point GCT at it:
+
+```bash
+gct --config configs/competitive_math.yaml \
+  --inference-backend sglang \
+  --sglang-base-url http://127.0.0.1:30000/v1 \
+  run-sweep --samples-per-task 3
+```
+
+For replicated serving, launch SGLang with its data-parallel/gateway mode and
+keep the same GCT client flags. For shell wrappers:
+
+```bash
+export INFERENCE_BACKEND=sglang
+export SGLANG_BASE_URL=http://127.0.0.1:30000/v1
+./scripts/run_cloud_sae_pipeline.sh
+```
+
+## Dynamic SAE-Transfer Queue
+
+Static sharding is still available, but SAE transfer can now run from a SQLite
+work queue. This is useful with SGLang because many lightweight workers can
+claim target-anchor rows dynamically while the SGLang server handles GPU-side
+batching/routing.
+
+```bash
+gct --config configs/competitive_math.yaml init-transfer-work-queue \
+  --neighbors runs/competitive_math/sae/neighbors_combo_cos07.csv
+
+gct --config configs/competitive_math.yaml work-queue-status
+
+gct --config configs/competitive_math.yaml \
+  --inference-backend sglang \
+  --sglang-base-url http://127.0.0.1:30000/v1 \
+  run-dynamic-sae-transfer \
+  --anchor-solutions runs/competitive_math/sweep/raw.jsonl \
+  --claim-size 4 \
+  --lease-seconds 900
+```
+
+Run multiple workers against the same queue to balance uneven target lengths:
+
+```bash
+for worker in 0 1 2 3; do
+  gct --config configs/competitive_math.yaml \
+    --inference-backend sglang \
+    --sglang-base-url http://127.0.0.1:30000/v1 \
+    run-dynamic-sae-transfer \
+    --anchor-solutions runs/competitive_math/sweep/raw.jsonl \
+    --worker-id "worker-$worker" \
+    >> "logs/dynamic-transfer-$worker.log" 2>&1 &
+done
+wait
 ```
 
 Default SAE scoring variants:
@@ -224,6 +402,7 @@ Resource/status commands:
 ```bash
 gct --config configs/competitive_math.yaml resource-report
 gct status --raw runs/competitive_math/sweep/raw.jsonl
+gct --config configs/competitive_math.yaml work-queue-status
 ```
 
 Cloud/SLURM wrappers:
@@ -303,6 +482,11 @@ Hot paths enqueue metrics into `runs/<name>/metrics/*.jsonl`; a background
 thread flushes aggregates every few seconds. This measures latency,
 arrival/service rates, and throughput without forcing the GPU loop to block on
 logging. W&B is optional and defaults to offline mode.
+
+Dataset loading is CPU-side by design: filesystems, JSON/HF decoding, Python
+normalization, tokenization, worker prefetching, and pinned-memory staging all
+happen before tensors are transferred to GPU. The GPU should spend its time on
+model compute, not blocking on filesystem and Python parsing work.
 
 ## API Keys
 

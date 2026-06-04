@@ -41,6 +41,14 @@ backend:
   cloud_provider: null
   cloud_profile: null
 
+inference:
+  backend: hf
+  sglang_base_url: http://127.0.0.1:30000/v1
+  sglang_api_key: null
+  sglang_model: null
+  sglang_timeout_s: 120.0
+  sglang_max_concurrency: 8
+
 telemetry:
   enabled: true
   flush_interval_s: 5.0
